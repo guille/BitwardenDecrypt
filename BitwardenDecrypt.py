@@ -13,6 +13,7 @@
 # - Changed shebang to use uv run and automatically instal dependencies
 # - Add "pyright: basic" comment
 # - Add support for Argon2 KDF (https://github.com/GurpreetKang/BitwardenDecrypt/issues/34)
+# - Output string to stdout (https://github.com/GurpreetKang/BitwardenDecrypt/issues/24)
 
 # Copyright © 2020-2022 Gurpreet Kang
 # All rights reserved.
@@ -972,7 +973,7 @@ def main(options):
             print(f"ERROR: Writing to {options.outputfile}")
 
     else:
-        print(decryptedJSON.encode("utf-8"))
+        print(decryptedJSON)
 
 
 if __name__ == "__main__":
