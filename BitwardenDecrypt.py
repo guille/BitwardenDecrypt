@@ -1,4 +1,17 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "cryptography",
+#     "argon2-cffi",
+# ]
+# ///
+
+# pyright: basic
+
+# Modifications (@guille):
+# - Changed shebang to use uv run and automatically instal dependencies
+# - Add "pyright: basic" comment
 
 # Copyright © 2020-2022 Gurpreet Kang
 # All rights reserved.
