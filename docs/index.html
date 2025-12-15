@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy"
+      content="
+        default-src 'none';
+        script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval';
+        style-src 'self' 'unsafe-inline';
+        img-src 'self';
+        font-src 'self';
+        connect-src 'none';
+        worker-src 'self';
+        object-src 'none';
+        base-uri 'none';
+        form-action 'none';
+      ">
+<title>Bitwarden EncryptedJSON Decrypt</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    max-width: 720px;
+    margin: 40px auto;
+    padding: 0 16px;
+  }
+  input, textarea, button {
+    width: 100%;
+    margin: 8px 0;
+    padding: 8px;
+    font-size: 0.95rem;
+  }
+  textarea {
+    min-height: 240px;
+    font-family: monospace;
+  }
+  button {
+    cursor: pointer;
+  }
+  .error {
+    color: #b00020;
+    white-space: pre-wrap;
+  }
+  button {
+    border-radius: 6px;
+  }
+  button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+  }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+
+<h1>Bitwarden EncryptedJSON Decrypt</h1>
+
+<p>You should probably not be using this! Try re-importing into Bitwarden instead, or using a tool you have full control over.</p>
+
+<input type="file" id="file" accept=".json" />
+<input type="password" id="password" placeholder="Encryption password" />
+<button id="decrypt">Decrypt</button>
+
+<div id="status"></div>
+
+
+<div id="dataSection" class="hidden">
+    <div style="justify-content: space-between; align-items: center; margin-bottom: 20px;">
+        <h2>Decrypted Data</h2>
+        <button id="downloadBtn" class="">💾 Download JSON</button>
+    </div>
+
+    <textarea readonly id="output" placeholder="Decrypted JSON will appear here"></textarea>
+</div>
+
+<script src="./argon2-bundled.min.js"></script>
+
+<script>
+const te = new TextEncoder();
+const td = new TextDecoder("utf-8", { fatal: true });
+let decryptedData = null;
+
+/* ---------- helpers ---------- */
+
+function b64ToBytes(s) {
+ const bin = atob(s);
+ const out = new Uint8Array(bin.length);
+ for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+ return out;
+}
+
+function concat(a, b) {
+ const out = new Uint8Array(a.length + b.length);
+ out.set(a, 0);
+ out.set(b, a.length);
+ return out;
+}
+
+/* ---------- crypto primitives ---------- */
+
+async function hmacSha256(keyBytes, dataBytes) {
+ const key = await crypto.subtle.importKey(
+   "raw",
+   keyBytes,
+   { name: "HMAC", hash: "SHA-256" },
+   false,
+   ["sign"]
+ );
+ return new Uint8Array(
+   await crypto.subtle.sign("HMAC", key, dataBytes)
+ );
+}
+
+async function aesCbcDecrypt(keyBytes, ivBytes, ctBytes) {
+ const key = await crypto.subtle.importKey(
+   "raw",
+   keyBytes,
+   { name: "AES-CBC" },
+   false,
+   ["decrypt"]
+ );
+ return new Uint8Array(
+   await crypto.subtle.decrypt(
+     { name: "AES-CBC", iv: ivBytes },
+     key,
+     ctBytes
+   )
+ );
+}
+
+/* ---------- HKDF-EXPAND ONLY ---------- */
+
+async function hkdfExpandPRK(prk, info, len = 32) {
+ const infoBytes = te.encode(info);
+ let prev = new Uint8Array(0);
+ let out = new Uint8Array(0);
+
+ for (let i = 1; out.length < len; i++) {
+   const input = new Uint8Array(prev.length + infoBytes.length + 1);
+   input.set(prev, 0);
+   input.set(infoBytes, prev.length);
+   input[input.length - 1] = i;
+
+   const t = await hmacSha256(prk, input);
+   const tmp = new Uint8Array(out.length + t.length);
+   tmp.set(out, 0);
+   tmp.set(t, out.length);
+   out = tmp;
+   prev = t;
+ }
+ return out.slice(0, len);
+}
+
+/* ---------- argon2 ---------- */
+
+function argon2HashToBytes(res) {
+ if (res.hash instanceof Uint8Array) return res.hash;
+ if (res.hash instanceof ArrayBuffer) return new Uint8Array(res.hash);
+ throw new Error("Unexpected argon2 output");
+}
+
+async function deriveMasterKey(password, email, iters, mem, parallelism) {
+ const salt = new Uint8Array(
+   await crypto.subtle.digest("SHA-256", te.encode(email))
+ );
+
+ const res = await argon2.hash({
+   pass: password,
+   salt,
+   time: iters,
+   mem: mem * 1024,
+   parallelism,
+   hashLen: 32,
+   type: argon2.ArgonType.Argon2id,
+ });
+
+ return argon2HashToBytes(res);
+}
+
+/* ---------- Bitwarden CipherString ---------- */
+
+async function decryptCipherString(cipher, encKey, macKey) {
+ const [, payload] = cipher.split(".");
+ const [ivB64, ctB64, macB64] = payload.split("|");
+
+ const iv = b64ToBytes(ivB64);
+ const ct = b64ToBytes(ctB64);
+ const mac = b64ToBytes(macB64);
+
+ const macInput = concat(iv, ct);
+ const calc = await hmacSha256(macKey, macInput);
+
+ for (let i = 0; i < mac.length; i++) {
+   if (calc[i] !== mac[i]) throw new Error("MAC mismatch");
+ }
+
+ return await aesCbcDecrypt(encKey, iv, ct);
+}
+
+/* ---------- ENTRYPOINT ---------- */
+
+async function decryptEncryptedJSON(text, password) {
+  const json = JSON.parse(text);
+
+  if (!json.encrypted || !json.passwordProtected)
+    throw new Error("Not EncryptedJSON");
+  if (json.kdfType !== 1)
+    throw new Error("Only argon2id supported");
+
+  const masterKey = await deriveMasterKey(
+    password,
+    json.salt,
+    json.kdfIterations,
+    json.kdfMemory,
+    json.kdfParallelism
+  );
+
+  const encKey = await hkdfExpandPRK(masterKey, "enc", 32);
+  const macKey = await hkdfExpandPRK(masterKey, "mac", 32);
+
+  const clear = await decryptCipherString(
+    json.data,
+    encKey,
+    macKey
+  );
+
+  return JSON.parse(td.decode(clear));
+}
+
+document.getElementById("decrypt").onclick = async () => {
+  const file = document.getElementById("file").files[0];
+  const password = document.getElementById("password").value;
+  const status = document.getElementById("status");
+  const output = document.getElementById("output");
+  const dataSection = document.getElementById("dataSection");
+  dataSection.classList.add('hidden');
+
+  status.textContent = "";
+  output.value = "";
+
+  if (!file || !password) {
+    status.textContent = "File + password required.";
+    return;
+  }
+
+  try {
+    status.textContent = "Decrypting…";
+    const text = await file.text();
+    const result = await decryptEncryptedJSON(text, password);
+    decryptedData = JSON.stringify(result, null, 2)
+    output.value = decryptedData;
+    status.textContent = "Done.";
+    dataSection.classList.remove('hidden');
+  } catch (e) {
+    status.innerHTML = `<div class="error">${e.message}</div>`;
+  }
+};
+
+document.getElementById("downloadBtn").onclick = async () => {
+  const blob = new Blob([decryptedData, null, 2], { type: 'application/json' });
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'bitwarden-decrypted.json';
+  a.click();
+  URL.revokeObjectURL(url);
+};
+</script>
+
+</body>
+</html>
